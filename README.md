@@ -28,7 +28,13 @@ Characters, lorebooks, chat completion presets and themes are supported. Charact
 
 Sends create separate copies. Existing characters, chats and edited copies stay intact. A repeated delivery of the same send imports once. Each received copy is recorded against its Illarin work and version outside the creator's file. Themes are saved without applying them; reload SillyTavern to see a new theme in its list.
 
-With library sharing on, the extension reports installed copies and removes deleted copies from the mirror. Only Illarin work IDs and version numbers leave SillyTavern. Local files, prompts and chats are not sent. Reports are incremental, with a full snapshot each hour. Illarin accepts at most 2,000 works per report.
+## Update installed works
+
+With library sharing on, **Extensions → Illarin** shows **Update available** beside an outdated copy, with the creator's version notes. Press **Update character**, **Update lorebook**, **Update preset** or **Update theme** to replace that copy. Receiving works must also be on. Checks run about once a minute while SillyTavern is open; **Check now** checks immediately.
+
+If you edited the copy, SillyTavern asks before replacing it and keeps it under a name containing **edited copy**. Copies received before this extension recorded their original content also ask. Cancel leaves your copy unchanged. An unedited copy updates without a question and is kept under a name containing **previous copy**. Character updates keep the same identifier and current chat, so existing chats and group references survive. Updates do not apply themes. Updating a preset selects the updated preset; reload SillyTavern to see a saved old preset in the list.
+
+With library sharing on, the extension reports installed copies and removes deleted copies from the mirror. Only Illarin work IDs and version numbers leave SillyTavern. Local files, prompts and chats are not sent. Reports are incremental, with a full snapshot each hour. Illarin accepts at most 2,000 works per report. Saved old copies stay local and are not reported as separate installations.
 
 One tab handles requests at a time. Other tabs can take over when it closes. Credentials and import records belong to the current SillyTavern user in this browser. Another browser needs its own connection.
 

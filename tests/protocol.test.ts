@@ -29,6 +29,8 @@ function setup(permissions: string[], responder?: (path: string, options: Reques
             return value;
         },
         installed: async items => items.filter(item => installed.some(local => local.localId === item.localId)),
+        update: async (item, _file, previous) => ({ ...previous, versionNumber: item.versionNumber }),
+        recover: async () => {},
     };
     const request: Fetch = async (input, options = {}) => {
         const path = new URL(String(input)).pathname;
@@ -39,7 +41,7 @@ function setup(permissions: string[], responder?: (path: string, options: Reques
         if (path.includes("/send/")) return new Response("synthetic-charx");
         return Response.json({ accepted: 1, removed: 0, ignored: 0 });
     };
-    return { client: new Client(storage, tavern, request), storage, requests, installed, imports: () => imports, fail: () => { failImport = true; } };
+    return { client: new Client(storage, tavern, request), storage, tavern, requests, installed, imports: () => imports, fail: () => { failImport = true; } };
 }
 
 test("grants from Illarin control collection and library sharing", async () => {
@@ -148,4 +150,79 @@ test("server identity keeps its path and refuses credentials and insecure remote
     expect(baseURL("http://localhost:8000")).toBe("http://localhost:8000");
     expect(() => baseURL("http://example.invalid")).toThrow();
     expect(() => baseURL("https://user:secret@example.invalid")).toThrow();
+});
+
+test("unchanged library checks still discover newly published versions and notes", async () => {
+    let published = 4;
+    const fixture = setup(["library:sync"], path => {
+        if (path.endsWith("/me")) return Response.json({ permissions: ["library:sync"] });
+        return Response.json({ entries: [{ workId: send.workId, versionNumber: published, notes: "A new greeting." }] });
+    });
+    fixture.installed.push({ workId: send.workId, versionNumber: 4, localId: "synthetic.png", type: "character" });
+    const state = await fixture.storage.read();
+    state.installs = structuredClone(fixture.installed);
+    await fixture.storage.save(state);
+    await fixture.client.cycle();
+    expect((await fixture.storage.read()).updates).toEqual([]);
+    published = 5;
+    await fixture.client.cycle(undefined, true);
+    expect((await fixture.storage.read()).updates).toEqual([{ workId: send.workId, versionNumber: 5, notes: "A new greeting." }]);
+    const report = fixture.requests.at(-1)!;
+    expect(JSON.parse(report.options.body as string).entries).toEqual([]);
+});
+
+test("an update replaces only the chosen copy and reports the received version", async () => {
+    const fixture = setup(["work:receive", "library:sync"], path => {
+        if (path.endsWith("/me")) return Response.json({ permissions: ["work:receive", "library:sync"] });
+        if (path.endsWith("/receive")) return Response.json({ id: send.id });
+        if (path.endsWith("/collect")) return Response.json({ sends: [send] });
+        if (path.includes("/send/")) return new Response("synthetic-charx");
+        return Response.json({ entries: [{ workId: send.workId, versionNumber: 4, notes: "New greeting" }] });
+    });
+    const old = { workId: send.workId, versionNumber: 1, localId: "synthetic.png", type: "character" };
+    fixture.installed.push(old);
+    const state = await fixture.storage.read();
+    state.installs = [old];
+    await fixture.storage.save(state);
+    await fixture.client.update(send.workId, old.localId);
+    await fixture.client.cycle();
+    const saved = await fixture.storage.read();
+    expect(fixture.imports()).toBe(0);
+    expect(saved.installs).toEqual([{ ...old, versionNumber: 4 }]);
+    expect(saved.pendingUpdates).toEqual([]);
+    expect(saved.acknowledged).toEqual([send.id]);
+    expect(saved.mirrored).toEqual([{ workId: send.workId, versionNumber: 4 }]);
+    expect(saved.updates).toEqual([]);
+});
+
+test("canceling an update then immediately retrying settles the canceled send first", async () => {
+    let queuedId = send.id;
+    const nextId = "b42b9b0f-f3f9-44c1-8e16-1a88c53f50ad";
+    const fixture = setup(["work:receive"], (path, options) => {
+        if (path.endsWith("/me")) return Response.json({ permissions: ["work:receive"] });
+        if (path.endsWith("/receive")) return Response.json({ id: queuedId, expiresAt: "2099-01-01T00:00:00Z" });
+        if (path.endsWith("/collect")) {
+            if (JSON.parse(options.body as string).acknowledge.includes(send.id)) {
+                queuedId = nextId;
+                return new Response(null, { status: 204 });
+            }
+            return Response.json({ sends: [{ ...send, id: queuedId }] });
+        }
+        return new Response("synthetic-charx");
+    });
+    const copy = { workId: send.workId, versionNumber: 1, localId: "synthetic.png", type: "character" };
+    const state = await fixture.storage.read();
+    state.installs = [copy];
+    await fixture.storage.save(state);
+    fixture.tavern.update = async () => null;
+    await fixture.client.update(copy.workId, copy.localId);
+    await fixture.client.cycle();
+    expect((await fixture.storage.read()).installs).toEqual([copy]);
+    fixture.tavern.update = async (_send, _file, previous) => ({ ...previous, versionNumber: 4 });
+    await fixture.client.update(copy.workId, copy.localId);
+    expect((await fixture.storage.read()).pendingUpdates?.[0].sendId).toBe(nextId);
+    await fixture.client.cycle();
+    const saved = await fixture.storage.read();
+    expect(saved.installs).toEqual([{ ...copy, versionNumber: 4 }]);
+    expect(saved.pendingUpdates).toEqual([]);
 });

@@ -5,7 +5,12 @@ interface Rename { type: string; oldId: string; newId: string }
 function renamed(state: State, renames: Rename[]): State {
     for (const rename of renames) {
         for (const install of state.installs) {
-            if (install.type === rename.type && install.localId === rename.oldId) install.localId = rename.newId;
+            if (install.type === rename.type && install.localId === rename.oldId) {
+                for (const pending of state.pendingUpdates || []) {
+                    if (pending.workId === install.workId && pending.localId === rename.oldId) pending.localId = rename.newId;
+                }
+                install.localId = rename.newId;
+            }
         }
     }
     return state;

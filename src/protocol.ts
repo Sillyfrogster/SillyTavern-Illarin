@@ -24,7 +24,12 @@ export interface Install {
     type: string;
     localId: string;
     apiId?: string;
+    fingerprint?: string;
+    name?: string;
+    recovery?: { chat: string; create_date?: string; fav?: boolean; data: { extensions: { fav: boolean } } };
 }
+
+export interface Update { workId: string; versionNumber: number; notes: string }
 
 export interface State {
     base: string;
@@ -35,6 +40,9 @@ export interface State {
     acknowledged: string[];
     mirrored: { workId: string; versionNumber: number }[];
     lastSnapshot: number;
+    lastCheck?: number;
+    updates?: Update[];
+    pendingUpdates?: { sendId: string; workId: string; localId: string; expiresAt?: string }[];
 }
 
 export interface Storage {
@@ -46,6 +54,8 @@ export interface Tavern {
     version: string;
     install(send: Send, file: Blob): Promise<Install>;
     installed(installs: Install[]): Promise<Install[]>;
+    update(send: Send, file: Blob, installed: Install, remember: () => Promise<void>, signal?: AbortSignal): Promise<Install | null>;
+    recover(installs: Install[], signal?: AbortSignal): Promise<void>;
 }
 
 export class RequestError extends Error {
@@ -99,17 +109,24 @@ export class Client {
             state.receipts = [];
             state.acknowledged = [];
             state.mirrored = [];
+            state.updates = [];
+            state.pendingUpdates = [];
         }
         state.base = base;
         state.credentials = credentials;
         state.refreshing = false;
         state.lastSnapshot = 0;
+        state.lastCheck = 0;
         await this.storage.save(state);
     }
 
     async disconnect() {
         const state = await this.storage.read();
+        if (state.installs.some(item => item.recovery)) await this.storage.save(state);
+        await this.tavern.recover(state.installs);
         delete state.credentials;
+        state.updates = [];
+        state.pendingUpdates = [];
         state.refreshing = false;
         await this.storage.save(state);
     }
@@ -141,15 +158,34 @@ export class Client {
         }
     }
 
-    async cycle(signal?: AbortSignal) {
+    async update(workId: string, localId: string, signal?: AbortSignal) {
+        let state = await this.storage.read();
+        if (!state.credentials || !state.installs.some(item => item.workId === workId && item.localId === localId)) throw new Error("This copy is no longer connected to Illarin.");
+        const queue = async () => await (await this.authorized(state, `/api/v1/works/${encodeURIComponent(workId)}/receive`, {}, signal)).json() as { id: string; expiresAt: string };
+        let queued = await queue();
+        if (state.receipts.includes(queued.id)) {
+            await this.cycle(signal);
+            state = await this.storage.read();
+            queued = await queue();
+            if (state.receipts.includes(queued.id)) throw new Error("Illarin has not settled the previous update. Try again.");
+        }
+        state.pendingUpdates = [...(state.pendingUpdates || []).filter(item => item.workId !== workId), { sendId: queued.id, workId, localId, expiresAt: queued.expiresAt }];
+        await this.storage.save(state);
+    }
+
+    async cycle(signal?: AbortSignal, force = false) {
         const state = await this.storage.read();
         if (!state.credentials) return;
+        if (state.installs.some(item => item.recovery)) await this.storage.save(state);
+        await this.tavern.recover(state.installs, signal);
+        state.pendingUpdates = state.pendingUpdates?.filter(item => !item.expiresAt || Date.parse(item.expiresAt) > Date.now());
         const standing = await this.authorized(state, "/api/v1/connected-apps/me", undefined, signal);
         const app = await standing.json();
         state.credentials!.connectedApp.permissions = app.permissions;
         await this.storage.save(state);
         const permissions = app.permissions as string[];
-        if (permissions.includes("library:sync")) await this.sync(state, signal);
+        if (permissions.includes("library:sync")) await this.sync(state, signal, force);
+        else { state.updates = []; await this.storage.save(state); }
         if (!permissions.includes("work:receive")) return;
         const acknowledged = [...state.acknowledged];
         const response = await this.authorized(state, "/api/v1/sends/collect", { acknowledge: acknowledged }, signal);
@@ -169,8 +205,16 @@ export class Client {
                     if (url.origin !== base.origin || !url.pathname.startsWith(`${base.pathname.replace(/\/$/, "")}/send/`)) throw new Error("Illarin returned an unexpected download address.");
                     const file = await this.request(url, { credentials: "omit", cache: "no-store", redirect: "error", signal });
                     if (!file.ok) throw new RequestError(file.status);
-                    const install = await this.tavern.install(send, await file.blob());
-                    state.installs.push(install);
+                    const pending = state.pendingUpdates?.find(item => item.sendId === send.id);
+                    const previous = pending && state.installs.find(item => item.workId === pending.workId && item.localId === pending.localId);
+                    if (pending && !previous) throw new Error("The copy to update is no longer available.");
+                    const blob = await file.blob();
+                    const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob);
+                    if (install) {
+                        if (previous) state.installs[state.installs.indexOf(previous)] = install;
+                        else state.installs.push(install);
+                    }
+                    state.pendingUpdates = state.pendingUpdates?.filter(item => item.sendId !== send.id);
                     state.receipts.push(send.id);
                 }
                 if (!state.acknowledged.includes(send.id)) state.acknowledged.push(send.id);
@@ -183,20 +227,24 @@ export class Client {
         if (failure) throw failure;
     }
 
-    async sync(state: State, signal?: AbortSignal) {
+    async sync(state: State, signal?: AbortSignal, force = false) {
         const installed = await this.tavern.installed(state.installs);
+        state.installs = installed;
         const versions = new Map<string, number>();
         for (const item of installed) versions.set(item.workId, Math.max(item.versionNumber, versions.get(item.workId) || 0));
         const entries = [...versions].map(([workId, versionNumber]) => ({ workId, versionNumber }));
         const snapshot = Date.now() - state.lastSnapshot > 3_600_000;
         const changed = entries.filter(item => !state.mirrored.some(old => old.workId === item.workId && old.versionNumber === item.versionNumber));
         const removed = state.mirrored.filter(old => !versions.has(old.workId)).map(item => item.workId);
-        if (!snapshot && !changed.length && !removed.length) return;
+        if (!force && !snapshot && !changed.length && !removed.length && Date.now() - (state.lastCheck || 0) < 60_000) return;
         if (entries.length > 2000 || removed.length > 2000) throw new Error("Your Illarin library exceeds the report limit.");
-        await this.authorized(state, "/api/v1/library/sync", {
+        const response = await this.authorized(state, "/api/v1/library/sync", {
             snapshot, appVersion: this.tavern.version, entries: snapshot ? entries : changed,
             ...(snapshot ? {} : { removed }),
         }, signal);
+        const result = await response.json() as { entries?: Update[] };
+        state.updates = (result.entries || []).filter(item => installed.some(copy => copy.workId === item.workId && copy.versionNumber < item.versionNumber));
+        state.lastCheck = Date.now();
         state.mirrored = entries;
         if (snapshot) state.lastSnapshot = Date.now();
         await this.storage.save(state);

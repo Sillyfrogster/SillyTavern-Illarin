@@ -66,16 +66,24 @@ class Client {
       state.receipts = [];
       state.acknowledged = [];
       state.mirrored = [];
+      state.updates = [];
+      state.pendingUpdates = [];
     }
     state.base = base;
     state.credentials = credentials;
     state.refreshing = false;
     state.lastSnapshot = 0;
+    state.lastCheck = 0;
     await this.storage.save(state);
   }
   async disconnect() {
     const state = await this.storage.read();
+    if (state.installs.some((item) => item.recovery))
+      await this.storage.save(state);
+    await this.tavern.recover(state.installs);
     delete state.credentials;
+    state.updates = [];
+    state.pendingUpdates = [];
     state.refreshing = false;
     await this.storage.save(state);
   }
@@ -108,17 +116,41 @@ class Client {
       return await this.json(state.base, path, body, state.credentials.accessToken, signal);
     }
   }
-  async cycle(signal) {
+  async update(workId, localId, signal) {
+    let state = await this.storage.read();
+    if (!state.credentials || !state.installs.some((item) => item.workId === workId && item.localId === localId))
+      throw new Error("This copy is no longer connected to Illarin.");
+    const queue = async () => await (await this.authorized(state, `/api/v1/works/${encodeURIComponent(workId)}/receive`, {}, signal)).json();
+    let queued = await queue();
+    if (state.receipts.includes(queued.id)) {
+      await this.cycle(signal);
+      state = await this.storage.read();
+      queued = await queue();
+      if (state.receipts.includes(queued.id))
+        throw new Error("Illarin has not settled the previous update. Try again.");
+    }
+    state.pendingUpdates = [...(state.pendingUpdates || []).filter((item) => item.workId !== workId), { sendId: queued.id, workId, localId, expiresAt: queued.expiresAt }];
+    await this.storage.save(state);
+  }
+  async cycle(signal, force = false) {
     const state = await this.storage.read();
     if (!state.credentials)
       return;
+    if (state.installs.some((item) => item.recovery))
+      await this.storage.save(state);
+    await this.tavern.recover(state.installs, signal);
+    state.pendingUpdates = state.pendingUpdates?.filter((item) => !item.expiresAt || Date.parse(item.expiresAt) > Date.now());
     const standing = await this.authorized(state, "/api/v1/connected-apps/me", undefined, signal);
     const app = await standing.json();
     state.credentials.connectedApp.permissions = app.permissions;
     await this.storage.save(state);
     const permissions = app.permissions;
     if (permissions.includes("library:sync"))
-      await this.sync(state, signal);
+      await this.sync(state, signal, force);
+    else {
+      state.updates = [];
+      await this.storage.save(state);
+    }
     if (!permissions.includes("work:receive"))
       return;
     const acknowledged = [...state.acknowledged];
@@ -144,8 +176,19 @@ class Client {
           const file = await this.request(url, { credentials: "omit", cache: "no-store", redirect: "error", signal });
           if (!file.ok)
             throw new RequestError(file.status);
-          const install = await this.tavern.install(send, await file.blob());
-          state.installs.push(install);
+          const pending = state.pendingUpdates?.find((item) => item.sendId === send.id);
+          const previous = pending && state.installs.find((item) => item.workId === pending.workId && item.localId === pending.localId);
+          if (pending && !previous)
+            throw new Error("The copy to update is no longer available.");
+          const blob = await file.blob();
+          const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob);
+          if (install) {
+            if (previous)
+              state.installs[state.installs.indexOf(previous)] = install;
+            else
+              state.installs.push(install);
+          }
+          state.pendingUpdates = state.pendingUpdates?.filter((item) => item.sendId !== send.id);
           state.receipts.push(send.id);
         }
         if (!state.acknowledged.includes(send.id))
@@ -160,8 +203,9 @@ class Client {
     if (failure)
       throw failure;
   }
-  async sync(state, signal) {
+  async sync(state, signal, force = false) {
     const installed = await this.tavern.installed(state.installs);
+    state.installs = installed;
     const versions = new Map;
     for (const item of installed)
       versions.set(item.workId, Math.max(item.versionNumber, versions.get(item.workId) || 0));
@@ -169,16 +213,19 @@ class Client {
     const snapshot = Date.now() - state.lastSnapshot > 3600000;
     const changed = entries.filter((item) => !state.mirrored.some((old) => old.workId === item.workId && old.versionNumber === item.versionNumber));
     const removed = state.mirrored.filter((old) => !versions.has(old.workId)).map((item) => item.workId);
-    if (!snapshot && !changed.length && !removed.length)
+    if (!force && !snapshot && !changed.length && !removed.length && Date.now() - (state.lastCheck || 0) < 60000)
       return;
     if (entries.length > 2000 || removed.length > 2000)
       throw new Error("Your Illarin library exceeds the report limit.");
-    await this.authorized(state, "/api/v1/library/sync", {
+    const response = await this.authorized(state, "/api/v1/library/sync", {
       snapshot,
       appVersion: this.tavern.version,
       entries: snapshot ? entries : changed,
       ...snapshot ? {} : { removed }
     }, signal);
+    const result = await response.json();
+    state.updates = (result.entries || []).filter((item) => installed.some((copy) => copy.workId === item.workId && copy.versionNumber < item.versionNumber));
+    state.lastCheck = Date.now();
     state.mirrored = entries;
     if (snapshot)
       state.lastSnapshot = Date.now();
@@ -190,8 +237,13 @@ class Client {
 function renamed(state, renames) {
   for (const rename of renames) {
     for (const install of state.installs) {
-      if (install.type === rename.type && install.localId === rename.oldId)
+      if (install.type === rename.type && install.localId === rename.oldId) {
+        for (const pending of state.pendingUpdates || []) {
+          if (pending.workId === install.workId && pending.localId === rename.oldId)
+            pending.localId = rename.newId;
+        }
         install.localId = rename.newId;
+      }
     }
   }
   return state;
@@ -311,23 +363,24 @@ class TavernAdapter {
     this.version = version;
     this.request = request;
   }
-  async post(path, body) {
+  async post(path, body, signal) {
     const multipart = body instanceof FormData;
     const response = await this.request(path, {
       method: "POST",
       headers: this.context.getRequestHeaders({ omitContentType: multipart }),
       body: multipart ? body : JSON.stringify(body),
-      cache: "no-store"
+      cache: "no-store",
+      signal
     });
     if (!response.ok)
       throw new Error("SillyTavern could not save the file. Check its connection and try again.");
     return response;
   }
-  async installed(installs) {
+  async installed(installs, signal) {
     if (!installs.length)
       return [];
-    const characters = installs.some((item) => item.type === "character") ? await (await this.post("/api/characters/all", {})).json() : [];
-    const settings = installs.some((item) => item.type !== "character") ? await (await this.post("/api/settings/get", {})).json() : { world_names: [], openai_setting_names: [], themes: [] };
+    const characters = installs.some((item) => item.type === "character") ? await (await this.post("/api/characters/all", {}, signal)).json() : [];
+    const settings = installs.some((item) => item.type !== "character") ? await (await this.post("/api/settings/get", {}, signal)).json() : { world_names: [], openai_setting_names: [], themes: [] };
     if (!Array.isArray(characters) || !Array.isArray(settings.world_names) || !Array.isArray(settings.openai_setting_names) || !Array.isArray(settings.themes))
       throw new Error("SillyTavern could not read your library. Nothing was removed from Illarin.");
     return installs.filter((item) => {
@@ -356,10 +409,133 @@ class TavernAdapter {
       versionNumber: send.versionNumber,
       type: send.type,
       localId: send.type === "character" ? `${stem}.png` : name,
+      name: send.name,
       ...send.type === "preset" ? { apiId: "openai" } : {}
     };
     if ((await this.installed([installed])).length)
       return installed;
+    await this.write(send, file, installed.localId);
+    if (send.type === "character")
+      await this.context.getCharacters();
+    if (!(await this.installed([installed])).length)
+      throw new Error("SillyTavern did not keep the imported file. Try again.");
+    installed.fingerprint = await this.fingerprint(await this.read(installed), installed);
+    return installed;
+  }
+  async read(install, signal) {
+    if (install.type === "character")
+      return await (await this.post("/api/characters/export", { avatar_url: install.localId, format: "png" }, signal)).blob();
+    let data;
+    if (install.type === "lorebook")
+      data = await (await this.post("/api/worldinfo/get", { name: install.localId }, signal)).json();
+    else {
+      const settings = await (await this.post("/api/settings/get", {}, signal)).json();
+      data = install.type === "theme" ? settings.themes.find((item) => item.name === install.localId) : JSON.parse(settings.openai_settings?.[settings.openai_setting_names.indexOf(install.localId)] || "null");
+    }
+    if (!data || typeof data !== "object")
+      throw new Error("SillyTavern could not read the installed copy. Nothing was replaced.");
+    return new Blob([JSON.stringify(data, (_key, value) => value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value)]);
+  }
+  async fingerprint(file, install) {
+    if (install.type === "character") {
+      const png = new Uint8Array(await file.arrayBuffer());
+      const parts = [];
+      let metadata = "", v3 = "";
+      if (png[0] !== 137 || png[1] !== 80)
+        throw new Error("SillyTavern could not read the portrait. Nothing was replaced.");
+      parts.push(png.slice(0, 8));
+      for (let offset = 8;offset < png.length; ) {
+        if (offset + 12 > png.length)
+          throw new Error("SillyTavern returned an incomplete portrait.");
+        const size = new DataView(png.buffer).getUint32(offset) + 12;
+        if (size > png.length - offset)
+          throw new Error("SillyTavern returned an incomplete portrait.");
+        const type = new TextDecoder().decode(png.slice(offset + 4, offset + 8));
+        if (!["tEXt", "zTXt", "iTXt"].includes(type))
+          parts.push(png.slice(offset, offset + size));
+        if (type === "tEXt") {
+          const text = new TextDecoder().decode(png.slice(offset + 8, offset + size - 4));
+          const separator = text.indexOf("\x00");
+          const keyword = text.slice(0, separator).toLowerCase();
+          if (keyword === "chara")
+            metadata = text.slice(separator + 1);
+          if (keyword === "ccv3")
+            v3 = text.slice(separator + 1);
+        }
+        offset += size;
+      }
+      const card = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(v3 || metadata), (char) => char.charCodeAt(0))));
+      if (!card.data || typeof card.data !== "object")
+        throw new Error("SillyTavern could not read the character. Nothing was replaced.");
+      const extensions = { ...card.data.extensions };
+      delete extensions.fav;
+      extensions.talkativeness = String(extensions.talkativeness ?? 0.5);
+      extensions.world ??= "";
+      extensions.depth_prompt = { prompt: "", depth: 4, role: "system", ...extensions.depth_prompt };
+      parts.push(JSON.stringify({ ...card.data, tags: card.data.tags ?? [], extensions }, (_key, value) => value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value));
+      file = new Blob(parts);
+    }
+    const bytes = await file.arrayBuffer();
+    if (crypto.subtle)
+      return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return btoa(Array.from(new Uint8Array(bytes), (byte) => String.fromCharCode(byte)).join(""));
+  }
+  async recover(installs, signal) {
+    const pending = installs.filter((install) => install.recovery);
+    const present = await this.installed(pending, signal);
+    for (const install of pending) {
+      if (present.includes(install))
+        await this.post("/api/characters/merge-attributes", { ...install.recovery, avatar: install.localId }, signal);
+      delete install.recovery;
+    }
+  }
+  async update(send, file, install, remember, signal) {
+    if (send.workId !== install.workId || send.type !== install.type || send.versionNumber <= install.versionNumber)
+      throw new Error("This file is not a newer version of your copy.");
+    const old = await this.read(install, signal);
+    const fingerprint = await this.fingerprint(old, install);
+    const edited = !install.fingerprint || fingerprint !== install.fingerprint;
+    if (edited && !await this.context.Popup.show.confirm("Replace your edited copy?", "SillyTavern keeps your copy under a name containing ‘edited copy’ before replacing it. Your chats stay with the updated character."))
+      return null;
+    signal?.throwIfAborted();
+    const suffix = Array.from(crypto.getRandomValues(new Uint32Array(4)), (value) => value.toString(16)).join("-");
+    const label = `${install.type === "character" ? send.name : install.localId} (${edited ? "edited copy" : "previous copy"} ${suffix})`;
+    if (install.type === "character") {
+      const previous = await (await this.post("/api/characters/get", { avatar_url: install.localId }, signal)).json();
+      if (typeof previous.chat !== "string")
+        throw new Error("SillyTavern could not read your current chat. Nothing was replaced.");
+      const backupId = `Illarin-backup-${suffix}.png`;
+      await this.write({ ...send, format: "chara_card_v3" }, old, backupId, false, signal);
+      await this.post("/api/characters/rename", { avatar_url: backupId, new_name: label }, signal);
+      if (fingerprint !== await this.fingerprint(await this.read(install, signal), install))
+        throw new Error("Your copy changed while the update was open. Try again.");
+      install.recovery = { chat: previous.chat, create_date: previous.create_date, fav: previous.fav, data: { extensions: { fav: previous.data?.extensions?.fav || false } } };
+      await remember();
+      const local = { ...install.recovery, avatar: install.localId };
+      try {
+        signal?.throwIfAborted();
+        await this.write(send, file, install.localId, false, signal);
+        await this.post("/api/characters/merge-attributes", local, signal);
+      } catch (error) {
+        await this.write({ ...send, format: "chara_card_v3" }, old, install.localId);
+        await this.post("/api/characters/merge-attributes", local);
+        throw error;
+      }
+      await this.context.getCharacters();
+    } else {
+      await this.write(send, old, label, true, signal);
+      if (fingerprint !== await this.fingerprint(await this.read(install, signal), install))
+        throw new Error("Your copy changed while the update was open. Try again.");
+      signal?.throwIfAborted();
+      await this.write(send, file, install.localId, false, signal);
+    }
+    delete install.recovery;
+    return { ...install, versionNumber: send.versionNumber, fingerprint: await this.fingerprint(await this.read(install, signal), install) };
+  }
+  async write(send, file, localId, backup = false, signal) {
+    signal?.throwIfAborted();
+    const stem = localId.replace(/\.png$/, "");
+    const name = localId;
     if (send.type === "character") {
       const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
       const format = send.format === "charx" ? "charx" : signature[0] === 137 && signature[1] === 80 ? "png" : "json";
@@ -367,34 +543,31 @@ class TavernAdapter {
       body.append("avatar", file, `${stem}.${format}`);
       body.append("file_type", format);
       body.append("preserved_name", stem);
-      const result = await (await this.post("/api/characters/import", body)).json();
+      const result = await (await this.post("/api/characters/import", body, signal)).json();
       if (result.error || result.file_name !== stem)
         throw new Error("SillyTavern could not import the character.");
-      await this.context.getCharacters();
     } else {
       const data = JSON.parse(await file.text());
       if (!data || typeof data !== "object" || Array.isArray(data))
         throw new Error("SillyTavern could not read the file.");
+      signal?.throwIfAborted();
       switch (send.type) {
         case "lorebook":
           if (!data.entries || typeof data.entries !== "object")
             throw new Error("This lorebook has no entries.");
-          await this.post("/api/worldinfo/edit", { name, data });
+          await this.post("/api/worldinfo/edit", { name, data }, signal);
           await this.context.updateWorldInfoList();
           break;
         case "preset":
           if (!Array.isArray(data.prompts) || !Array.isArray(data.prompt_order))
             throw new Error("This preset has no prompts.");
-          await this.context.getPresetManager("openai").savePreset(name, data);
+          await this.context.getPresetManager("openai").savePreset(name, data, { skipUpdate: backup });
           break;
         case "theme":
-          await this.post("/api/themes/save", { ...data, name });
+          await this.post("/api/themes/save", { ...data, name }, signal);
           break;
       }
     }
-    if (!(await this.installed([installed])).length)
-      throw new Error("SillyTavern did not keep the imported file. Try again.");
-    return installed;
   }
 }
 
@@ -412,11 +585,12 @@ async function start() {
   if (typeof user.handle !== "string" || typeof version.pkgVersion !== "string")
     throw new Error("SillyTavern could not read your account. Reload the page.");
   const storage = new BrowserStorage(user.handle);
-  const tavern = new TavernAdapter(context, version.pkgVersion);
-  const client = new Client(storage, tavern, async (input, options) => {
+  const request = async (input, options) => {
     await storage.renew();
     return fetch(input, { ...options, signal: AbortSignal.any([options?.signal || new AbortController().signal, AbortSignal.timeout(45000)]) });
-  });
+  };
+  const tavern = new TavernAdapter(context, version.pkgVersion, request);
+  const client = new Client(storage, tavern, request);
   const panel = document.createElement("div");
   panel.className = "illarin-settings";
   panel.innerHTML = `<div class="inline-drawer">
@@ -428,6 +602,7 @@ async function start() {
         <p id="illarin-status" role="status" aria-live="polite"></p>
         <div id="illarin-approval" hidden><p>Type this code on Illarin: <strong id="illarin-code"></strong></p><a id="illarin-verify" target="_blank" rel="noopener noreferrer">Open Illarin</a><p>Approve only a connection you started, and check only the permissions you want.</p></div>
         <p id="illarin-library"></p>
+        <div id="illarin-updates"></div>
         <p>Credentials stay in this browser. Scripts on this SillyTavern origin can read them. Revoke access in your Illarin account settings.</p>
       </div>
     </div>`;
@@ -445,6 +620,7 @@ async function start() {
   let timer;
   let backgroundRunning = false;
   let checkRequested = false;
+  let updateRequested = false;
   async function render() {
     const state = await storage.read();
     address.value = state.base;
@@ -453,6 +629,44 @@ async function start() {
     check.hidden = !state.credentials;
     connect.hidden = !!state.credentials;
     element("library").textContent = state.credentials?.connectedApp.permissions.includes("library:sync") ? `${state.mirrored.length} installed ${state.mirrored.length === 1 ? "work" : "works"} shared with Illarin` : "Your library is not shared.";
+    element("updates").replaceChildren();
+    for (const update of state.updates || []) {
+      for (const copy of state.installs.filter((item) => item.workId === update.workId && item.versionNumber < update.versionNumber)) {
+        const row = document.createElement("div");
+        const name = document.createElement("p");
+        name.textContent = `${copy.name || copy.localId} — Update available`;
+        const notes = document.createElement("p");
+        notes.textContent = update.notes;
+        notes.className = "illarin-version-notes";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "menu_button";
+        const pending = state.pendingUpdates?.some((item) => item.workId === copy.workId);
+        button.textContent = pending ? "Retry update" : `Update ${copy.type}`;
+        button.disabled = updateRequested || !!operation && !backgroundRunning || !state.credentials?.connectedApp.permissions.includes("work:receive");
+        button.addEventListener("click", () => {
+          (async () => {
+            if (updateRequested)
+              return;
+            updateRequested = true;
+            await render();
+            await operation;
+            try {
+              await run(async (signal) => {
+                await client.update(copy.workId, copy.localId, signal);
+                await client.cycle(signal, true);
+                status.textContent = "Update check finished.";
+              });
+            } finally {
+              updateRequested = false;
+              await render();
+            }
+          })();
+        });
+        row.append(name, notes, button);
+        element("updates").append(row);
+      }
+    }
   }
   const pause = (ms, signal) => new Promise((resolve, reject) => {
     const abort = () => {
@@ -493,6 +707,7 @@ async function start() {
         await render();
       }
     })();
+    await render();
     await operation;
   }
   let delay = 1000;
@@ -502,13 +717,15 @@ async function start() {
       return;
     }
     backgroundRunning = true;
+    const force = checkRequested;
+    checkRequested = false;
     clearTimeout(timer);
     delay = 1000;
     try {
       const state = await storage.read();
       if (!stopped && state.credentials && !operation) {
         await run(async (signal) => {
-          await client.cycle(signal);
+          await client.cycle(signal, force);
           const latest = await storage.read();
           const permissions = latest.credentials?.connectedApp.permissions || [];
           status.textContent = permissions.includes("work:receive") ? "Connected. Waiting for works from Illarin." : "Connected. Receiving works is off in your Illarin account settings.";
@@ -519,7 +736,6 @@ async function start() {
       timer = setTimeout(() => {
         background();
       }, checkRequested ? 0 : Math.max(delay, failures ? Math.min(60000, 2000 * 2 ** Math.min(failures, 5)) * (1 + Math.random()) : 5000));
-      checkRequested = false;
     }
   }
   connect.addEventListener("click", () => {
@@ -588,6 +804,7 @@ async function start() {
   });
   check.addEventListener("click", () => {
     stopped = false;
+    checkRequested = true;
     background();
   });
   for (const [event, renamed] of [["CHARACTER_RENAMED", true], ["PRESET_RENAMED", false]]) {

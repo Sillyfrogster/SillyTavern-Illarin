@@ -5,3 +5,8 @@
 .illarin-settings button {
     white-space: nowrap;
 }
+
+.illarin-version-notes {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}

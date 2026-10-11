@@ -1,4 +1,4 @@
-import { baseURL, Client, RequestError } from "./protocol";
+import { baseURL, Client, RequestError, type Fetch } from "./protocol";
 import { BrowserStorage } from "./storage";
 import { TavernAdapter, type Context } from "./tavern";
 
@@ -15,11 +15,12 @@ async function start() {
     const version = await versionResponse.json();
     if (typeof user.handle !== "string" || typeof version.pkgVersion !== "string") throw new Error("SillyTavern could not read your account. Reload the page.");
     const storage = new BrowserStorage(user.handle);
-    const tavern = new TavernAdapter(context, version.pkgVersion);
-    const client = new Client(storage, tavern, async (input, options) => {
+    const request: Fetch = async (input, options) => {
         await storage.renew();
         return fetch(input, { ...options, signal: AbortSignal.any([options?.signal || new AbortController().signal, AbortSignal.timeout(45_000)]) });
-    });
+    };
+    const tavern = new TavernAdapter(context, version.pkgVersion, request);
+    const client = new Client(storage, tavern, request);
     const panel = document.createElement("div");
     panel.className = "illarin-settings";
     panel.innerHTML = `<div class="inline-drawer">
@@ -31,6 +32,7 @@ async function start() {
         <p id="illarin-status" role="status" aria-live="polite"></p>
         <div id="illarin-approval" hidden><p>Type this code on Illarin: <strong id="illarin-code"></strong></p><a id="illarin-verify" target="_blank" rel="noopener noreferrer">Open Illarin</a><p>Approve only a connection you started, and check only the permissions you want.</p></div>
         <p id="illarin-library"></p>
+        <div id="illarin-updates"></div>
         <p>Credentials stay in this browser. Scripts on this SillyTavern origin can read them. Revoke access in your Illarin account settings.</p>
       </div>
     </div>`;
@@ -48,6 +50,7 @@ async function start() {
     let timer: ReturnType<typeof setTimeout>;
     let backgroundRunning = false;
     let checkRequested = false;
+    let updateRequested = false;
 
     async function render() {
         const state = await storage.read();
@@ -58,6 +61,38 @@ async function start() {
         connect.hidden = !!state.credentials;
         element("library").textContent = state.credentials?.connectedApp.permissions.includes("library:sync")
             ? `${state.mirrored.length} installed ${state.mirrored.length === 1 ? "work" : "works"} shared with Illarin` : "Your library is not shared.";
+        element("updates").replaceChildren();
+        for (const update of state.updates || []) {
+            for (const copy of state.installs.filter(item => item.workId === update.workId && item.versionNumber < update.versionNumber)) {
+                const row = document.createElement("div");
+                const name = document.createElement("p");
+                name.textContent = `${copy.name || copy.localId} — Update available`;
+                const notes = document.createElement("p");
+                notes.textContent = update.notes;
+                notes.className = "illarin-version-notes";
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "menu_button";
+                const pending = state.pendingUpdates?.some(item => item.workId === copy.workId);
+                button.textContent = pending ? "Retry update" : `Update ${copy.type}`;
+                button.disabled = updateRequested || (!!operation && !backgroundRunning) || !state.credentials?.connectedApp.permissions.includes("work:receive");
+                button.addEventListener("click", () => { void (async () => {
+                    if (updateRequested) return;
+                    updateRequested = true;
+                    await render();
+                    await operation;
+                    try {
+                        await run(async signal => {
+                            await client.update(copy.workId, copy.localId, signal);
+                            await client.cycle(signal, true);
+                            status.textContent = "Update check finished.";
+                        });
+                    } finally { updateRequested = false; await render(); }
+                })(); });
+                row.append(name, notes, button);
+                element("updates").append(row);
+            }
+        }
     }
 
     const pause = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
@@ -89,6 +124,7 @@ async function start() {
                 await render();
             }
         })();
+        await render();
         await operation;
     }
 
@@ -96,13 +132,15 @@ async function start() {
     async function background() {
         if (backgroundRunning) { checkRequested = true; return; }
         backgroundRunning = true;
+        const force = checkRequested;
+        checkRequested = false;
         clearTimeout(timer);
         delay = 1000;
         try {
             const state = await storage.read();
             if (!stopped && state.credentials && !operation) {
                 await run(async signal => {
-                    await client.cycle(signal);
+                    await client.cycle(signal, force);
                     const latest = await storage.read();
                     const permissions = latest.credentials?.connectedApp.permissions || [];
                     status.textContent = permissions.includes("work:receive") ? "Connected. Waiting for works from Illarin." : "Connected. Receiving works is off in your Illarin account settings.";
@@ -111,7 +149,6 @@ async function start() {
         } finally {
             backgroundRunning = false;
             timer = setTimeout(() => { void background(); }, checkRequested ? 0 : Math.max(delay, failures ? Math.min(60_000, 2000 * 2 ** Math.min(failures, 5)) * (1 + Math.random()) : 5000));
-            checkRequested = false;
         }
     }
 
@@ -172,7 +209,7 @@ async function start() {
             });
         })();
     });
-    check.addEventListener("click", () => { stopped = false; void background(); });
+    check.addEventListener("click", () => { stopped = false; checkRequested = true; void background(); });
     for (const [event, renamed] of [["CHARACTER_RENAMED", true], ["PRESET_RENAMED", false]] as const) {
         context.eventSource.on(context.eventTypes[event], (...args: any[]) => {
             if (renamed) void storage.rename("character", args[0], args[1]);
