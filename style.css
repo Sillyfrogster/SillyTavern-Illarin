@@ -1,0 +1,7 @@
+.illarin-settings [hidden] {
+    display: none !important;
+}
+
+.illarin-settings button {
+    white-space: nowrap;
+}

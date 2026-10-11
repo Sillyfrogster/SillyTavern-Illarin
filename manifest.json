@@ -1,0 +1,9 @@
+{
+  "display_name": "Illarin",
+  "loading_order": 10,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Illarin",
+  "version": "0.1.0",
+  "minimum_client_version": "1.19.0"
+}
