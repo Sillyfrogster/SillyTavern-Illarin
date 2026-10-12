@@ -2,6 +2,38 @@ import { expect, test } from "bun:test";
 import { TavernAdapter } from "../src/tavern";
 import type { Install, Send } from "../src/protocol";
 
+for (const type of ["lorebook", "preset", "theme"]) test(`${type} imports use the work name and keep separate copies on retries and name collisions`, async () => {
+    const copies = new Map<string, any>();
+    const data = type === "lorebook" ? { entries: {} } : type === "preset" ? { prompts: [], prompt_order: [] } : { font_scale: 1 };
+    const request = (async (url, options) => {
+        const path = String(url);
+        const body = JSON.parse(options!.body as string);
+        if (path === "/api/settings/get") return Response.json({
+            world_names: [...copies.keys()], openai_setting_names: [...copies.keys()],
+            openai_settings: [...copies.values()].map(value => JSON.stringify(value)),
+            themes: [...copies].map(([name, value]) => ({ ...value, name })),
+        });
+        if (path === "/api/worldinfo/get") return Response.json(copies.get(body.name));
+        if (path === "/api/worldinfo/edit") copies.set(body.name, body.data);
+        else if (path === "/api/themes/save") copies.set(body.name, body);
+        else throw new Error(`Unexpected native request: ${path}`);
+        return Response.json({});
+    }) as typeof fetch;
+    const context = { getRequestHeaders: () => ({}), updateWorldInfoList: async () => {}, getPresetManager: () => ({ savePreset: async (name: string, value: unknown) => { copies.set(name, value); } }) };
+    const adapter = new TavernAdapter(context as never, "1.19.0", request);
+    const send: Send = { id: "b42b9b0f-f3f9-44c1-8e16-1a88c53f50ac", workId: "synthetic-work", versionNumber: 1, name: "Paper library", type, format: `${type}_sillytavern`, files: [] };
+    let reserved: Install | undefined;
+    const reserve = async (proposed: Install) => reserved ||= proposed;
+    const first = await adapter.install(send, new Blob([JSON.stringify(data)]), reserve);
+    expect(first.localId).toBe("Paper library");
+    copies.set(first.localId, { ...data, localEdit: true });
+    expect((await adapter.install(send, new Blob([JSON.stringify(data)]), reserve)).localId).toBe(first.localId);
+    expect(copies.get(first.localId).localEdit).toBe(true);
+    const second = await adapter.install({ ...send, id: "b42b9b0f-f3f9-44c1-8e16-1a88c53f50ad" }, new Blob([JSON.stringify(data)]));
+    expect(second.localId).toBe("Paper library (2)");
+    expect(copies.size).toBe(2);
+});
+
 function characterPNG(content: string): Blob {
     const text = new TextEncoder().encode("chara\0" + btoa(JSON.stringify({ data: { description: content } })));
     const bytes = new Uint8Array(text.length + 32);

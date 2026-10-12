@@ -85,6 +85,23 @@ test("an import failure leaves the send unacknowledged", async () => {
     expect((await fixture.storage.read()).receipts).toEqual([]);
 });
 
+test("an interrupted import reuses the name saved before writing the file", async () => {
+    const fixture = setup(["work:receive"]);
+    let failed = false;
+    fixture.tavern.install = async (item, _file, reserve) => {
+        const chosen = await reserve!({ workId: item.workId, versionNumber: item.versionNumber, type: item.type, localId: failed ? "Library (2)" : "Library" });
+        expect((await fixture.storage.read()).importing?.[item.id]?.localId).toBe("Library");
+        if (!failed) { failed = true; throw new Error("Import interrupted after writing"); }
+        return chosen;
+    };
+    await expect(fixture.client.cycle()).rejects.toThrow("interrupted");
+    await fixture.client.cycle();
+    const state = await fixture.storage.read();
+    expect(state.installs[0].localId).toBe("Library");
+    expect(state.importing?.[send.id]).toBeUndefined();
+    expect(state.receipts).toEqual([send.id]);
+});
+
 test("library sharing stays off when only receiving is granted", async () => {
     const fixture = setup(["work:receive"]);
     await fixture.client.cycle();

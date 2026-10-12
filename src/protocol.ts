@@ -43,6 +43,7 @@ export interface State {
     lastCheck?: number;
     updates?: Update[];
     pendingUpdates?: { sendId: string; workId: string; localId: string; expiresAt?: string }[];
+    importing?: Record<string, Install>;
 }
 
 export interface Storage {
@@ -52,7 +53,7 @@ export interface Storage {
 
 export interface Tavern {
     version: string;
-    install(send: Send, file: Blob): Promise<Install>;
+    install(send: Send, file: Blob, reserve?: (install: Install) => Promise<Install>): Promise<Install>;
     installed(installs: Install[]): Promise<Install[]>;
     update(send: Send, file: Blob, installed: Install, remember: () => Promise<void>, signal?: AbortSignal): Promise<Install | null>;
     recover(installs: Install[], signal?: AbortSignal): Promise<void>;
@@ -111,6 +112,7 @@ export class Client {
             state.mirrored = [];
             state.updates = [];
             state.pendingUpdates = [];
+            state.importing = {};
         }
         state.base = base;
         state.credentials = credentials;
@@ -209,12 +211,18 @@ export class Client {
                     const previous = pending && state.installs.find(item => item.workId === pending.workId && item.localId === pending.localId);
                     if (pending && !previous) throw new Error("The copy to update is no longer available.");
                     const blob = await file.blob();
-                    const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob);
+                    const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob, async proposed => {
+                        state.importing ||= {};
+                        state.importing[send.id] ||= proposed;
+                        await this.storage.save(state);
+                        return state.importing[send.id];
+                    });
                     if (install) {
                         if (previous) state.installs[state.installs.indexOf(previous)] = install;
                         else state.installs.push(install);
                     }
                     state.pendingUpdates = state.pendingUpdates?.filter(item => item.sendId !== send.id);
+                    delete state.importing?.[send.id];
                     state.receipts.push(send.id);
                 }
                 if (!state.acknowledged.includes(send.id)) state.acknowledged.push(send.id);

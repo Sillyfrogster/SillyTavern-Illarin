@@ -48,16 +48,20 @@ export class TavernAdapter implements Tavern {
         });
     }
 
-    async install(send: Send, file: Blob): Promise<Install> {
+    async install(send: Send, file: Blob, reserve?: (install: Install) => Promise<Install>): Promise<Install> {
         const types: Record<string, string> = { charx: "character", chara_card_v3: "character", chara_card_v2: "character", lorebook_sillytavern: "lorebook", preset_sillytavern: "preset", theme_sillytavern: "theme" };
         if (types[send.format] !== send.type || !/^[0-9a-f-]{36}$/.test(send.id)) throw new Error("SillyTavern cannot import this file.");
         const stem = `Illarin-${send.id}`;
-        const name = `${send.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, " ").trim().slice(0, 80) || send.type} (${stem})`;
-        const installed: Install = {
+        const name = send.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, " ").trim().slice(0, 80) || send.type;
+        let installed: Install = {
             workId: send.workId, versionNumber: send.versionNumber, type: send.type,
             localId: send.type === "character" ? `${stem}.png` : name, name: send.name,
             ...(send.type === "preset" ? { apiId: "openai" } : {}),
         };
+        if (send.type !== "character") {
+            for (let number = 2; (await this.installed([installed])).length; number++) installed.localId = `${name} (${number})`;
+        }
+        if (reserve) installed = await reserve(installed);
         if ((await this.installed([installed])).length) return installed;
         await this.write(send, file, installed.localId);
         if (send.type === "character") await this.context.getCharacters();

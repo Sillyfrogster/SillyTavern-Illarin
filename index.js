@@ -68,6 +68,7 @@ class Client {
       state.mirrored = [];
       state.updates = [];
       state.pendingUpdates = [];
+      state.importing = {};
     }
     state.base = base;
     state.credentials = credentials;
@@ -181,7 +182,12 @@ class Client {
           if (pending && !previous)
             throw new Error("The copy to update is no longer available.");
           const blob = await file.blob();
-          const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob);
+          const install = previous ? await this.tavern.update(send, blob, previous, () => this.storage.save(state), signal) : await this.tavern.install(send, blob, async (proposed) => {
+            state.importing ||= {};
+            state.importing[send.id] ||= proposed;
+            await this.storage.save(state);
+            return state.importing[send.id];
+          });
           if (install) {
             if (previous)
               state.installs[state.installs.indexOf(previous)] = install;
@@ -189,6 +195,7 @@ class Client {
               state.installs.push(install);
           }
           state.pendingUpdates = state.pendingUpdates?.filter((item) => item.sendId !== send.id);
+          delete state.importing?.[send.id];
           state.receipts.push(send.id);
         }
         if (!state.acknowledged.includes(send.id))
@@ -398,13 +405,13 @@ class TavernAdapter {
       }
     });
   }
-  async install(send, file) {
+  async install(send, file, reserve) {
     const types = { charx: "character", chara_card_v3: "character", chara_card_v2: "character", lorebook_sillytavern: "lorebook", preset_sillytavern: "preset", theme_sillytavern: "theme" };
     if (types[send.format] !== send.type || !/^[0-9a-f-]{36}$/.test(send.id))
       throw new Error("SillyTavern cannot import this file.");
     const stem = `Illarin-${send.id}`;
-    const name = `${send.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, " ").trim().slice(0, 80) || send.type} (${stem})`;
-    const installed = {
+    const name = send.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, " ").trim().slice(0, 80) || send.type;
+    let installed = {
       workId: send.workId,
       versionNumber: send.versionNumber,
       type: send.type,
@@ -412,6 +419,12 @@ class TavernAdapter {
       name: send.name,
       ...send.type === "preset" ? { apiId: "openai" } : {}
     };
+    if (send.type !== "character") {
+      for (let number = 2;(await this.installed([installed])).length; number++)
+        installed.localId = `${name} (${number})`;
+    }
+    if (reserve)
+      installed = await reserve(installed);
     if ((await this.installed([installed])).length)
       return installed;
     await this.write(send, file, installed.localId);

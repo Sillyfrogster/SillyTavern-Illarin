@@ -26,7 +26,7 @@ On an Illarin work page, send the work to **SillyTavern / Illarin extension**. K
 
 Characters, lorebooks, chat completion presets and themes are supported. Characters prefer CharX, which carries embedded pictures. The extension also reads CCv2 and CCv3 character files. It does not declare support for separate picture downloads, packs or installing other extensions.
 
-Sends create separate copies. Existing characters, chats and edited copies stay intact. A repeated delivery of the same send imports once. Each received copy is recorded against its Illarin work and version outside the creator's file. Themes are saved without applying them; reload SillyTavern to see a new theme in its list.
+Sends create separate copies under the work's name. If that name is already taken, lorebooks, presets and themes get a short number, such as **Paper library (2)**. Existing characters, chats and edited copies stay intact. A repeated delivery of the same send imports once. Each received copy is recorded against its Illarin work and version outside the creator's file. Themes are saved without applying them; reload SillyTavern to see a new theme in its list.
 
 ## Update installed works
 
